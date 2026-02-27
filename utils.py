@@ -1,248 +1,371 @@
-# utils.py
-from __future__ import annotations
-
+import io
 import re
+import zipfile
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import folium
 
 
 # ----------------------------
-# Parsing de coordenadas (GMS -> graus decimais)
+# Modelos / tipos auxiliares
 # ----------------------------
 
-_DMS_REGEX = re.compile(
-    r"""
-    ^\s*
-    (?P<deg>[+-]?\d+(?:[.,]\d+)?)      # graus
-    (?:\s*[°\s]\s*|\s+)?
-    (?P<min>\d+(?:[.,]\d+)?)?         # minutos (opcional)
-    (?:\s*[\'’′\s]\s*|\s+)?
-    (?P<sec>\d+(?:[.,]\d+)?)?         # segundos (opcional)
-    (?:\s*(?:\"|”|″)\s*)?
-    (?P<hem>[NSEWnsew])?              # hemisfério (opcional)
-    \s*$
-    """,
-    re.VERBOSE,
-)
+@dataclass
+class CoordGMS:
+    """Representa uma coordenada em GMS + hemisfério, preservando o texto original."""
+    graus: float
+    minutos: float
+    segundos: float
+    hemisferio: str  # N, S, E, W
+    original: str    # string original (para tooltip)
 
-
-def _to_float(x: str) -> float:
-    return float(x.replace(",", "."))
-
-
-def parse_dms(dms_str: Any, expected: str) -> Optional[float]:
-    """
-    Converte coordenadas em GMS (DMS) para graus decimais.
-
-    Aceita variações como:
-    - 40° 26' 46'' N
-    - 40 26 46 N
-    - 40:26:46N
-    - 40°26'46\"N
-    - 40 26 N (sem segundos)
-    - 40 N (apenas graus)
-
-    Regras:
-    - Se houver hemisfério (N/S/E/W), ele define o sinal.
-    - Se não houver hemisfério, aceita sinal negativo/positivo em graus.
-    - expected deve ser "lat" ou "lon" para validar hemisférios.
-    """
-    if dms_str is None or (isinstance(dms_str, float) and pd.isna(dms_str)):
-        return None
-
-    s = str(dms_str).strip()
-    if not s:
-        return None
-
-    # normaliza separadores comuns
-    s = s.replace(":", " ")
-    s = s.replace("º", "°")
-    s = re.sub(r"\s+", " ", s)
-
-    m = _DMS_REGEX.match(s)
-    if not m:
-        return None
-
-    deg_raw = m.group("deg")
-    min_raw = m.group("min")
-    sec_raw = m.group("sec")
-    hem_raw = m.group("hem")
-
-    deg = _to_float(deg_raw)
-    minutes = _to_float(min_raw) if min_raw is not None else 0.0
-    seconds = _to_float(sec_raw) if sec_raw is not None else 0.0
-    hem = hem_raw.upper() if hem_raw else None
-
-    # valida faixas
-    if minutes < 0 or minutes >= 60 or seconds < 0 or seconds >= 60:
-        return None
-
-    decimal = abs(deg) + (minutes / 60.0) + (seconds / 3600.0)
-
-    # sinal por hemisfério (se existir), senão pelo sinal em deg
-    if hem:
-        if expected == "lat" and hem not in ("N", "S"):
-            return None
-        if expected == "lon" and hem not in ("E", "W"):
-            return None
-        if hem in ("S", "W"):
-            decimal = -decimal
-    else:
-        if deg < 0:
-            decimal = -decimal
-
-    # valida range final
-    if expected == "lat" and not (-90 <= decimal <= 90):
-        return None
-    if expected == "lon" and not (-180 <= decimal <= 180):
-        return None
-
-    return decimal
-
-
-# ----------------------------
-# Limpeza/validação do CSV
-# ----------------------------
-
-EXPECTED_COLUMNS = {
-    "nome_trecho": ["nome_trecho", "trecho", "nome", "nome do trecho"],
-    "extensao": ["extensao", "extensão", "comprimento", "length", "km", "m"],
-    "lat_inicio": ["lat_inicio", "latitude_inicio", "lat ini", "inicio_lat", "lat start"],
-    "lon_inicio": ["lon_inicio", "longitude_inicio", "lon ini", "inicio_lon", "lon start"],
-    "lat_fim": ["lat_fim", "latitude_fim", "lat fim", "fim_lat", "lat end"],
-    "lon_fim": ["lon_fim", "longitude_fim", "lon fim", "fim_lon", "lon end"],
-}
+    def to_decimal(self) -> float:
+        val = abs(self.graus) + (self.minutos / 60.0) + (self.segundos / 3600.0)
+        if self.hemisferio.upper() in ("S", "W"):
+            val *= -1.0
+        return val
 
 
 @dataclass
-class CleanResult:
-    df: pd.DataFrame
-    errors: List[Dict[str, Any]]
+class Trecho:
+    nome: str
+    extensao: float
+    inicio_lat: CoordGMS
+    inicio_lon: CoordGMS
+    fim_lat: CoordGMS
+    fim_lon: CoordGMS
 
 
-def _normalize_header(h: str) -> str:
-    h = str(h).strip().lower()
-    h = h.replace("\ufeff", "")  # BOM
-    h = re.sub(r"\s+", " ", h)
-    return h
+# ----------------------------
+# Parsing de GMS
+# ----------------------------
+
+_GMS_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<deg>-?\d+(?:\.\d+)?)\s*(?:°|º|d|deg)?\s*[, ]*\s*
+    (?P<min>\d+(?:\.\d+)?)\s*(?:'|’|m|min)?\s*[, ]*\s*
+    (?P<sec>\d+(?:\.\d+)?)\s*(?:"|”|''|s|sec)?\s*
+    (?P<hem>[NSEW])?
+    \s*$
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_HEM_RE = re.compile(r"\b([NSEW])\b", re.IGNORECASE)
 
 
-def _coerce_extensao(x: Any) -> Optional[float]:
-    if x is None or (isinstance(x, float) and pd.isna(x)):
-        return None
-    if isinstance(x, (int, float)) and not pd.isna(x):
-        return float(x)
+def _normalize_gms_string(value: str) -> str:
+    """Normaliza aspas e símbolos comuns para facilitar parsing."""
+    s = str(value).strip()
+    s = s.replace("”", '"').replace("“", '"').replace("´", "'").replace("’", "'")
+    s = s.replace("º", "°")
+    # Alguns CSVs vêm com duplas aspas escapadas
+    s = s.replace("''", '"')
+    return s
 
-    s = str(x).strip()
-    if not s:
-        return None
 
-    # extrai o primeiro número (aceita "12,3 km", "1000m", etc.)
-    m = re.search(r"[+-]?\d+(?:[.,]\d+)?", s)
+def parse_gms(value: str, default_hemisphere: Optional[str] = None) -> CoordGMS:
+    """
+    Aceita formatos como:
+      - 40° 26' 46" N
+      - 40 26 46 N
+      - 40,26,46 N
+      - 40 26 46 (hemisfério inferido por default_hemisphere)
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        raise ValueError("Coordenada vazia.")
+
+    raw = _normalize_gms_string(str(value))
+
+    # Tenta extrair hemisfério de qualquer lugar da string
+    hem_match = _HEM_RE.search(raw)
+    hem = hem_match.group(1).upper() if hem_match else (default_hemisphere.upper() if default_hemisphere else None)
+
+    # Remove o hemisfério antes do parse principal, se necessário
+    raw_no_hem = re.sub(r"\b[NSEW]\b", "", raw, flags=re.IGNORECASE).strip()
+
+    m = _GMS_RE.match(raw_no_hem if hem else raw)
     if not m:
-        return None
-    try:
-        return float(m.group(0).replace(",", "."))
-    except ValueError:
-        return None
+        # Tentativa extra: separar por espaços/virgulas e pegar 3 números
+        tokens = re.split(r"[,\s]+", raw_no_hem if hem else raw)
+        nums = []
+        for t in tokens:
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", t):
+                nums.append(t)
+        if len(nums) >= 3:
+            deg, minute, sec = nums[0], nums[1], nums[2]
+        else:
+            raise ValueError(f"Formato GMS não reconhecido: '{value}'")
+    else:
+        deg = m.group("deg")
+        minute = m.group("min")
+        sec = m.group("sec")
+        hem = hem or (m.group("hem").upper() if m.group("hem") else None)
+
+    if hem is None:
+        raise ValueError(f"Hemisfério ausente (N/S/E/W) em: '{value}'")
+
+    g = float(deg)
+    mi = float(minute)
+    se = float(sec)
+
+    if mi < 0 or mi >= 60 or se < 0 or se >= 60:
+        raise ValueError(f"Minutos/segundos fora do intervalo em: '{value}'")
+
+    # Preserva uma forma “bonita” para tooltip
+    original_fmt = format_gms_for_label(g, mi, se, hem)
+
+    return CoordGMS(graus=g, minutos=mi, segundos=se, hemisferio=hem, original=original_fmt)
 
 
-def standardize_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tenta padronizar as colunas para:
-    nome_trecho, extensao, lat_inicio, lon_inicio, lat_fim, lon_fim
-
-    Estratégia:
-    1) Se tiver cabeçalho com nomes reconhecíveis -> mapeia por nomes
-    2) Caso contrário -> assume A..F por posição (primeiras 6 colunas)
-    """
-    df = df_raw.copy()
-
-    # Se o CSV veio com header, pandas tende a ter colunas nomeadas (strings)
-    # Se vier sem header, colunas serão inteiros (0..n-1).
-    has_string_header = all(isinstance(c, str) for c in df.columns)
-
-    if has_string_header:
-        norm_cols = {_normalize_header(c): c for c in df.columns}
-        mapping: Dict[str, str] = {}
-
-        for target, aliases in EXPECTED_COLUMNS.items():
-            found = None
-            for a in aliases:
-                a_norm = _normalize_header(a)
-                if a_norm in norm_cols:
-                    found = norm_cols[a_norm]
-                    break
-            if found:
-                mapping[target] = found
-
-        if len(mapping) == 6:
-            df = df.rename(columns={mapping[k]: k for k in mapping})
-            return df[list(mapping.keys())]
-
-    # fallback por posição A..F
-    if df.shape[1] < 6:
-        raise ValueError("O arquivo precisa ter pelo menos 6 colunas (A–F).")
-
-    df = df.iloc[:, :6].copy()
-    df.columns = ["nome_trecho", "extensao", "lat_inicio", "lon_inicio", "lat_fim", "lon_fim"]
-    return df
+def format_gms_for_label(g: float, m: float, s: float, hem: str) -> str:
+    g_abs = abs(g)
+    return f"{int(round(g_abs))}° {int(round(m))}' {float(s):.0f}'' {hem.upper()}"
 
 
-def clean_data(df_raw: pd.DataFrame) -> CleanResult:
-    """
-    Valida e converte dados. Linhas inválidas são ignoradas e registradas em errors.
-    Retorna df limpo com colunas originais + colunas *_dd (graus decimais).
-    """
-    df_std = standardize_dataframe(df_raw)
+# ----------------------------
+# Validação / leitura do CSV
+# ----------------------------
 
-    clean_rows: List[Dict[str, Any]] = []
-    errors: List[Dict[str, Any]] = []
+EXPECTED_COLUMNS = [
+    "Nome do Trecho",
+    "Extensão do Trecho",
+    "Início Lat (GMS)",
+    "Início Lon (GMS)",
+    "Fim Lat (GMS)",
+    "Fim Lon (GMS)",
+]
 
-    for i, row in df_std.iterrows():
-        linha = int(i) + 1  # 1-based para ser mais amigável
 
-        nome = row.get("nome_trecho")
-        if nome is None or (isinstance(nome, float) and pd.isna(nome)) or str(nome).strip() == "":
-            errors.append({"linha": linha, "erro": "nome_trecho vazio"})
-            continue
-        nome = str(nome).strip()
-
-        ext = _coerce_extensao(row.get("extensao"))
-        if ext is None:
-            errors.append({"linha": linha, "erro": "extensao inválida"})
-            continue
-
-        lat_i = row.get("lat_inicio")
-        lon_i = row.get("lon_inicio")
-        lat_f = row.get("lat_fim")
-        lon_f = row.get("lon_fim")
-
-        lat_i_dd = parse_dms(lat_i, expected="lat")
-        lon_i_dd = parse_dms(lon_i, expected="lon")
-        lat_f_dd = parse_dms(lat_f, expected="lat")
-        lon_f_dd = parse_dms(lon_f, expected="lon")
-
-        if any(v is None for v in (lat_i_dd, lon_i_dd, lat_f_dd, lon_f_dd)):
-            errors.append({"linha": linha, "erro": "coordenadas GMS inválidas ou fora de faixa"})
-            continue
-
-        clean_rows.append(
-            {
-                "nome_trecho": nome,
-                "extensao": ext,
-                "lat_inicio": str(lat_i).strip(),
-                "lon_inicio": str(lon_i).strip(),
-                "lat_fim": str(lat_f).strip(),
-                "lon_fim": str(lon_f).strip(),
-                "lat_inicio_dd": lat_i_dd,
-                "lon_inicio_dd": lon_i_dd,
-                "lat_fim_dd": lat_f_dd,
-                "lon_fim_dd": lon_f_dd,
-            }
+def validate_columns(df: pd.DataFrame) -> None:
+    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Colunas ausentes no arquivo: "
+            + ", ".join(missing)
+            + ".\n\n"
+            + "Colunas esperadas:\n- "
+            + "\n- ".join(EXPECTED_COLUMNS)
         )
 
-    df_clean = pd.DataFrame(clean_rows)
-    return CleanResult(df=df_clean, errors=errors)
+
+def parse_trechos(df: pd.DataFrame) -> List[Trecho]:
+    """
+    Converte o DataFrame em lista de Trecho, validando linha a linha.
+    """
+    validate_columns(df)
+
+    trechos: List[Trecho] = []
+    errors: List[str] = []
+
+    for idx, row in df.iterrows():
+        line = idx + 2  # considerando cabeçalho na linha 1
+        try:
+            nome = str(row["Nome do Trecho"]).strip()
+            if not nome:
+                raise ValueError("Nome do Trecho vazio.")
+
+            extensao = float(row["Extensão do Trecho"])
+
+            inicio_lat = parse_gms(row["Início Lat (GMS)"], default_hemisphere="S")
+            inicio_lon = parse_gms(row["Início Lon (GMS)"], default_hemisphere="W")
+            fim_lat = parse_gms(row["Fim Lat (GMS)"], default_hemisphere="S")
+            fim_lon = parse_gms(row["Fim Lon (GMS)"], default_hemisphere="W")
+
+            trechos.append(
+                Trecho(
+                    nome=nome,
+                    extensao=extensao,
+                    inicio_lat=inicio_lat,
+                    inicio_lon=inicio_lon,
+                    fim_lat=fim_lat,
+                    fim_lon=fim_lon,
+                )
+            )
+        except Exception as e:
+            errors.append(f"Linha {line}: {e}")
+
+    if errors:
+        # Mostra até 20 para não poluir a UI
+        msg = "Foram encontrados erros ao ler o arquivo:\n- " + "\n- ".join(errors[:20])
+        if len(errors) > 20:
+            msg += f"\n- ... e mais {len(errors) - 20} erro(s)."
+        raise ValueError(msg)
+
+    if not trechos:
+        raise ValueError("Nenhum trecho válido foi encontrado no arquivo.")
+
+    return trechos
+
+
+# ----------------------------
+# Mapa (Folium)
+# ----------------------------
+
+def _color_palette() -> List[str]:
+    # Paleta simples e bem distinta
+    return [
+        "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+        "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        "#00A6FB", "#F25F5C", "#70C1B3", "#FFE066", "#50514F",
+    ]
+
+
+def build_map(trechos: List[Trecho], tiles: str = "OpenStreetMap") -> folium.Map:
+    # Centraliza no primeiro trecho (início)
+    first = trechos[0]
+    center = (first.inicio_lat.to_decimal(), first.inicio_lon.to_decimal())
+    m = folium.Map(location=center, zoom_start=12, tiles=tiles, control_scale=True)
+
+    palette = _color_palette()
+
+    for i, t in enumerate(trechos):
+        color = palette[i % len(palette)]
+
+        inicio = (t.inicio_lat.to_decimal(), t.inicio_lon.to_decimal())
+        fim = (t.fim_lat.to_decimal(), t.fim_lon.to_decimal())
+
+        tooltip_inicio = (
+            f"Início do Trecho {t.inicio_lat.original}, {t.inicio_lon.original} - Trecho {t.nome} "
+            f"(Extensão: {t.extensao})"
+        )
+        tooltip_fim = (
+            f"Final do Trecho {t.fim_lat.original}, {t.fim_lon.original} - Trecho {t.nome} "
+            f"(Extensão: {t.extensao})"
+        )
+
+        # Marcadores
+        folium.CircleMarker(
+            location=inicio,
+            radius=6,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.9,
+            tooltip=tooltip_inicio,
+            popup=tooltip_inicio,
+        ).add_to(m)
+
+        folium.CircleMarker(
+            location=fim,
+            radius=6,
+            color=color,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.9,
+            tooltip=tooltip_fim,
+            popup=tooltip_fim,
+        ).add_to(m)
+
+        # Linha conectando início -> fim (associação lógica do trecho)
+        folium.PolyLine(
+            locations=[inicio, fim],
+            color=color,
+            weight=3,
+            opacity=0.8,
+            tooltip=f"Trecho {t.nome} (Extensão: {t.extensao})",
+        ).add_to(m)
+
+    folium.LayerControl(collapsed=True).add_to(m)
+    return m
+
+
+# ----------------------------
+# Exportação KMZ (KML + zip)
+# ----------------------------
+
+def export_kmz(trechos: List[Trecho], kmz_name: str = "trechos.kmz") -> Tuple[bytes, str]:
+    """
+    Gera um KMZ em memória (bytes) com:
+      - Pasta por trecho
+      - Placemark início e fim
+      - LineString ligando início-fim
+    Retorna (bytes, filename).
+    """
+    try:
+        import simplekml
+    except Exception as e:
+        raise RuntimeError(
+            "Dependência 'simplekml' não encontrada. Inclua no requirements.txt: simplekml>=1.3.6"
+        ) from e
+
+    kml = simplekml.Kml()
+    palette = _color_palette()
+
+    for i, t in enumerate(trechos):
+        color_hex = palette[i % len(palette)]
+        # KML usa AABBGGRR; vamos forçar alpha FF e converter #RRGGBB
+        rrggbb = color_hex.lstrip("#")
+        aabbggrr = "ff" + rrggbb[4:6] + rrggbb[2:4] + rrggbb[0:2]
+
+        folder = kml.newfolder(name=t.nome)
+
+        ini_lat = t.inicio_lat.to_decimal()
+        ini_lon = t.inicio_lon.to_decimal()
+        fim_lat = t.fim_lat.to_decimal()
+        fim_lon = t.fim_lon.to_decimal()
+
+        desc_common = f"Trecho: {t.nome}\nExtensão: {t.extensao}"
+
+        p_ini = folder.newpoint(
+            name=f"Início - {t.nome}",
+            coords=[(ini_lon, ini_lat)],
+        )
+        p_ini.description = (
+            f"Início do Trecho {t.inicio_lat.original}, {t.inicio_lon.original}\n{desc_common}"
+        )
+
+        p_fim = folder.newpoint(
+            name=f"Final - {t.nome}",
+            coords=[(fim_lon, fim_lat)],
+        )
+        p_fim.description = (
+            f"Final do Trecho {t.fim_lat.original}, {t.fim_lon.original}\n{desc_common}"
+        )
+
+        ls = folder.newlinestring(
+            name=f"Linha - {t.nome}",
+            coords=[(ini_lon, ini_lat), (fim_lon, fim_lat)],
+        )
+        ls.description = desc_common
+        ls.style.linestyle.color = aabbggrr
+        ls.style.linestyle.width = 3
+
+    kml_bytes = kml.kml().encode("utf-8")
+
+    # Empacota como KMZ (ZIP com doc.kml)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("doc.kml", kml_bytes)
+
+    return buf.getvalue(), kmz_name
+
+
+# ----------------------------
+# Exemplo de CSV (para download)
+# ----------------------------
+
+def sample_dataframe() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Nome do Trecho": "Rio Claro",
+                "Extensão do Trecho": 1.25,
+                "Início Lat (GMS)": "22° 54' 10'' S",
+                "Início Lon (GMS)": "47° 03' 12'' W",
+                "Fim Lat (GMS)": "22° 54' 45'' S",
+                "Fim Lon (GMS)": "47° 02' 40'' W",
+            },
+            {
+                "Nome do Trecho": "Córrego Azul",
+                "Extensão do Trecho": 0.80,
+                "Início Lat (GMS)": "22 55 05 S",
+                "Início Lon (GMS)": "47 04 20 W",
+                "Fim Lat (GMS)": "22 55 40 S",
+                "Fim Lon (GMS)": "47 03 55 W",
+            },
+        ]
+    )

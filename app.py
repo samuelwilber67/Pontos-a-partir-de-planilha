@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 
@@ -12,12 +13,12 @@ from utils import (
 
 st.set_page_config(page_title="Visualizador de Trechos", layout="wide")
 
-st.title("Mapa de Trechos a partir de Planilha (CSV)")
+st.title("Mapa de Trechos a partir de Planilha (CSV/XLS)")
 
 st.markdown(
     """
 **O que este app faz**
-- Você envia um **CSV** com trechos (nome, extensão e coordenadas em **GMS**).
+- Você envia um **CSV** ou **XLS (Excel antigo)** com trechos (nome, extensão e coordenadas em **GMS**).
 - O app converte **GMS → graus decimais** e mostra no **mapa interativo**.
 - Você pode **exportar KMZ** (Google Earth) com pontos e linhas.
 
@@ -32,7 +33,11 @@ st.markdown(
 
 with st.sidebar:
     st.header("Upload")
-    uploaded = st.file_uploader("Envie um arquivo CSV", type=["csv"])
+
+    uploaded = st.file_uploader(
+        "Envie um arquivo CSV ou XLS",
+        type=["csv", "xls"],
+    )
 
     st.markdown(
         """
@@ -47,13 +52,26 @@ with st.sidebar:
     )
 
 if not uploaded:
-    st.info("Envie um CSV para começar.")
+    st.info("Envie um CSV ou XLS para começar.")
     st.stop()
 
+name = (uploaded.name or "").lower()
+_, ext = os.path.splitext(name)
+
 try:
-    df = pd.read_csv(uploaded)
+    if ext == ".csv":
+        df = pd.read_csv(uploaded)
+    elif ext == ".xls":
+        # XLS (Excel antigo) → usa xlrd
+        df = pd.read_excel(uploaded, engine="xlrd")
+    else:
+        st.error("Formato não suportado. Envie um arquivo .csv ou .xls.")
+        st.stop()
 except Exception:
-    st.error("Não consegui ler o CSV. Verifique separador/encoding e tente novamente.")
+    st.error(
+        "Não consegui ler o arquivo. Verifique se o arquivo está íntegro "
+        "e se as dependências estão instaladas (especialmente `xlrd` para .xls)."
+    )
     st.stop()
 
 val = validate_df(df)
@@ -68,14 +86,13 @@ df["inicio_lon_dec"] = df["inicio_lon_gms"].apply(gms_to_decimal)
 df["fim_lat_dec"] = df["fim_lat_gms"].apply(gms_to_decimal)
 df["fim_lon_dec"] = df["fim_lon_gms"].apply(gms_to_decimal)
 
-# Falhas de conversão
 bad = df[
     df[["inicio_lat_dec", "inicio_lon_dec", "fim_lat_dec", "fim_lon_dec"]].isna().any(axis=1)
 ]
 if not bad.empty:
     st.error(
         "Há coordenadas GMS inválidas (não foi possível converter). "
-        "Corrija o CSV e envie novamente. Ex.: `40° 26' 46\" N`."
+        "Corrija a planilha e envie novamente. Ex.: `40° 26' 46\" N`."
     )
     st.write("Linhas com erro:")
     st.dataframe(bad)

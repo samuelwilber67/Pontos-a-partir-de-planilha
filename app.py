@@ -12,18 +12,17 @@ from utils import (
 )
 
 st.set_page_config(page_title="Visualizador de Trechos", layout="wide")
-
-st.title("Mapa de Trechos a partir de Planilha (CSV/XLS)")
+st.title("Mapa de Trechos a partir de Planilha (CSV/XLS/XLSX)")
 
 st.markdown(
     """
 **O que este app faz**
-- Você envia um **CSV** ou **XLS (Excel antigo)** com trechos (nome, extensão e coordenadas em **GMS**).
+- Você envia um **CSV**, **XLS** ou **XLSX** com trechos (nome, extensão e coordenadas em **GMS**).
 - O app converte **GMS → graus decimais** e mostra no **mapa interativo**.
 - Você pode **exportar KMZ** (Google Earth) com pontos e linhas.
 
-**Formato GMS aceito (robusto)**
-- Exemplos válidos:
+**Formato GMS aceito**
+- Exemplos:
   - `40° 26' 46" N`
   - `40 26 46 N`
   - `79°58'56"W`
@@ -35,8 +34,8 @@ with st.sidebar:
     st.header("Upload")
 
     uploaded = st.file_uploader(
-        "Envie um arquivo CSV ou XLS",
-        type=["csv", "xls"],
+        "Envie um arquivo CSV, XLS ou XLSX",
+        type=["csv", "xls", "xlsx"],
     )
 
     st.markdown(
@@ -52,7 +51,7 @@ with st.sidebar:
     )
 
 if not uploaded:
-    st.info("Envie um CSV ou XLS para começar.")
+    st.info("Envie um arquivo para começar.")
     st.stop()
 
 name = (uploaded.name or "").lower()
@@ -62,15 +61,18 @@ try:
     if ext == ".csv":
         df = pd.read_csv(uploaded)
     elif ext == ".xls":
-        # XLS (Excel antigo) → usa xlrd
+        # Excel antigo
         df = pd.read_excel(uploaded, engine="xlrd")
+    elif ext == ".xlsx":
+        # Excel moderno
+        df = pd.read_excel(uploaded, engine="openpyxl")
     else:
-        st.error("Formato não suportado. Envie um arquivo .csv ou .xls.")
+        st.error("Formato não suportado. Envie .csv, .xls ou .xlsx.")
         st.stop()
 except Exception:
     st.error(
-        "Não consegui ler o arquivo. Verifique se o arquivo está íntegro "
-        "e se as dependências estão instaladas (especialmente `xlrd` para .xls)."
+        "Não consegui ler o arquivo. Verifique se o arquivo está íntegro e se as dependências "
+        "estão instaladas (`xlrd` para .xls e `openpyxl` para .xlsx)."
     )
     st.stop()
 
@@ -79,7 +81,6 @@ if not val["valid"]:
     st.error(val["message"])
     st.stop()
 
-# Converte GMS para decimal (lat/lon início/fim)
 df = df.copy()
 df["inicio_lat_dec"] = df["inicio_lat_gms"].apply(gms_to_decimal)
 df["inicio_lon_dec"] = df["inicio_lon_gms"].apply(gms_to_decimal)
@@ -117,17 +118,13 @@ with col1:
 
 with col2:
     st.subheader("Exportação")
-    try:
-        kmz_bytes = build_kmz_bytes(df)
-        st.download_button(
-            label="Baixar KMZ",
-            data=kmz_bytes,
-            file_name="trechos.kmz",
-            mime="application/vnd.google-earth.kmz",
-        )
-    except Exception:
-        st.error("Falha ao gerar KMZ. Verifique os dados e dependências.")
-        st.stop()
+    kmz_bytes = build_kmz_bytes(df)
+    st.download_button(
+        label="Baixar KMZ",
+        data=kmz_bytes,
+        file_name="trechos.kmz",
+        mime="application/vnd.google-earth.kmz",
+    )
 
 st.subheader("Mapa")
 m = build_folium_map(df)

@@ -1,75 +1,117 @@
-import io
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+
 from streamlit_folium import st_folium
 
 from utils import (
-    EXPECTED_COLUMNS,
-    build_map,
-    export_kmz,
-    parse_trechos,
-    sample_dataframe,
+    validate_df,
+    gms_to_decimal,
+    build_folium_map,
+    build_kmz_bytes,
 )
 
-st.set_page_config(page_title="Trechos em Mapa (GMS → Decimal)", layout="wide")
+st.set_page_config(page_title="Visualizador de Trechos", layout="wide")
 
-st.title("Visualizador de Trechos (CSV) – Mapa + Exportação KMZ")
+st.title("Mapa de Trechos a partir de Planilha (CSV)")
 
-st.write(
-    "Faça upload de um CSV com trechos (início/fim em GMS). "
-    "O app mostra os pontos no mapa e permite exportar um KMZ para Google Earth."
+st.markdown(
+    """
+**O que este app faz**
+- Você envia um **CSV** com trechos (nome, extensão e coordenadas em **GMS**).
+- O app converte **GMS → graus decimais** e mostra no **mapa interativo**.
+- Você pode **exportar KMZ** (Google Earth) com pontos e linhas.
+
+**Formato GMS aceito (robusto)**
+- Exemplos válidos:
+  - `40° 26' 46" N`
+  - `40 26 46 N`
+  - `79°58'56"W`
+- Direção obrigatória no final: `N`, `S`, `E`, `W`.
+"""
 )
 
-with st.expander("Formato esperado do CSV (colunas obrigatórias)", expanded=True):
-    st.write("O arquivo deve conter exatamente estas colunas (nomes iguais):")
-    st.code("\n".join(EXPECTED_COLUMNS), language="text")
+with st.sidebar:
+    st.header("Upload")
+    uploaded = st.file_uploader("Envie um arquivo CSV", type=["csv"])
 
-    st.write("Você pode baixar um CSV de exemplo para testar:")
-    df_ex = sample_dataframe()
-    csv_bytes = df_ex.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Baixar CSV de exemplo",
-        data=csv_bytes,
-        file_name="exemplo_trechos.csv",
-        mime="text/csv",
+    st.markdown(
+        """
+**Colunas obrigatórias**
+- `trecho_nome`
+- `extensao`
+- `inicio_lat_gms`
+- `inicio_lon_gms`
+- `fim_lat_gms`
+- `fim_lon_gms`
+"""
     )
 
-uploaded = st.file_uploader("Upload do CSV", type=["csv"])
-
 if not uploaded:
+    st.info("Envie um CSV para começar.")
     st.stop()
 
 try:
-    # Lê CSV com tolerância a separadores comuns
-    content = uploaded.getvalue()
-    # Tenta UTF-8; se falhar, tenta latin-1
+    df = pd.read_csv(uploaded)
+except Exception:
+    st.error("Não consegui ler o CSV. Verifique separador/encoding e tente novamente.")
+    st.stop()
+
+val = validate_df(df)
+if not val["valid"]:
+    st.error(val["message"])
+    st.stop()
+
+# Converte GMS para decimal (lat/lon início/fim)
+df = df.copy()
+df["inicio_lat_dec"] = df["inicio_lat_gms"].apply(gms_to_decimal)
+df["inicio_lon_dec"] = df["inicio_lon_gms"].apply(gms_to_decimal)
+df["fim_lat_dec"] = df["fim_lat_gms"].apply(gms_to_decimal)
+df["fim_lon_dec"] = df["fim_lon_gms"].apply(gms_to_decimal)
+
+# Falhas de conversão
+bad = df[
+    df[["inicio_lat_dec", "inicio_lon_dec", "fim_lat_dec", "fim_lon_dec"]].isna().any(axis=1)
+]
+if not bad.empty:
+    st.error(
+        "Há coordenadas GMS inválidas (não foi possível converter). "
+        "Corrija o CSV e envie novamente. Ex.: `40° 26' 46\" N`."
+    )
+    st.write("Linhas com erro:")
+    st.dataframe(bad)
+    st.stop()
+
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.subheader("Prévia dos dados")
+    st.dataframe(
+        df[
+            [
+                "trecho_nome",
+                "extensao",
+                "inicio_lat_gms",
+                "inicio_lon_gms",
+                "fim_lat_gms",
+                "fim_lon_gms",
+            ]
+        ]
+    )
+
+with col2:
+    st.subheader("Exportação")
     try:
-        df = pd.read_csv(io.BytesIO(content))
-    except UnicodeDecodeError:
-        df = pd.read_csv(io.BytesIO(content), encoding="latin-1")
-
-    trechos = parse_trechos(df)
-
-    col1, col2 = st.columns([2, 1])
-
-    with col2:
-        st.subheader("Exportação")
-        kmz_bytes, kmz_filename = export_kmz(trechos, kmz_name="trechos.kmz")
+        kmz_bytes = build_kmz_bytes(df)
         st.download_button(
             label="Baixar KMZ",
             data=kmz_bytes,
-            file_name=kmz_filename,
+            file_name="trechos.kmz",
             mime="application/vnd.google-earth.kmz",
         )
+    except Exception:
+        st.error("Falha ao gerar KMZ. Verifique os dados e dependências.")
+        st.stop()
 
-        st.caption("O KMZ contém pontos (início/fim) e a linha de cada trecho.")
-
-    with col1:
-        st.subheader("Mapa interativo")
-        m = build_map(trechos, tiles="OpenStreetMap")
-        st_folium(m, width=None, height=650)
-
-except Exception as e:
-    st.error("Não foi possível processar o arquivo.")
-    st.exception(e)
+st.subheader("Mapa")
+m = build_folium_map(df)
+st_folium(m, use_container_width=True, height=650)
